@@ -1,0 +1,1232 @@
+---
+title: "analisis_exploratorio"
+author: "Douglas Hernandez"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+
+```{r cfg}
+
+# Configurando R para que no imprima valores en notación científica
+options(scipen = 999)
+
+# Carga de paquetes para realizar el análisis
+library(tidyverse)
+library(tidyquant)
+library(janitor)
+library(readxl)
+library(skimr)
+library(viridis)
+library(arules)
+library(GGally)
+library(fastDummies)
+library(caret)
+library(xgboost)
+library(nnet)
+library(randomForest)
+library(DescTools)
+library(pROC)
+library(rsample)
+library(Boruta)
+
+```
+
+
+```{r carga de datos}
+# Carga de datos usados: Default of Credit Cards
+raw_data <- read_excel("data/raw_data/default of credit card clients.xlsx",
+                       sheet = "Data",
+                       range = "A3:Y30003") %>% 
+    clean_names()
+
+```
+
+Variables 
+
+
+id: Id del registro
+limit_bal : Monto del crédito otorgado en dólares Taiwaneses (Limite de la tarjeta de crédito)
+sex: Sexo del cliente (1:Masculino, 2:Femenino)
+education: Nivel educativo del cliente (0=unknown, 1=graduate school, 2=university, 3=high school, 4=others, 5=unknown, 6=unknown)
+marriage: Estado civil del cliente (1=married, 2=single, 3=others)
+age: Edad del cliente
+pay_0 ~ pay_6: Estado del pago (-2=no consumption,-1=pay duly, 1=payment delay for one month, 2=payment delay for two months, … 8=payment delay for eight months, 9=payment delay for nine months and above)
+bill_amt1 ~ bill_amt2: Monto de la factura
+pay_amt1 ~ pay_amt6: Monto del pago hecho por el cliente
+default payment next month: Indicador de default (0:No, 1:Si)
+
+
+```{r}
+
+tidy_data <- raw_data %>% 
+    
+    # Recodificación de registros inconsistentes, ya que en el diccionario de datos no se tiene definición para todos los valores
+    # existentes en los campos de education y marriage
+    
+    mutate(
+        
+        # Recodificando los registros con 0, 5, 6 a 4:Others
+        education = if_else(education %in% c(0, 5, 6), 4, education),
+        
+        # Recodificando los registros 0 a 3:Others
+        marriage = if_else(marriage == 0, 3, marriage)
+        
+        ) %>% 
+    
+    # Transformando los montos de dólares taiwaneses a euros
+    mutate_at(c(2, 13:24), ~ round(. * 0.029,2))
+
+```
+
+
+
+```{r}
+
+
+# Limpieza y codificación del dataset
+tidy_data <- tidy_data %>% 
+    
+    # Transformando las variables a factor
+    mutate(
+        
+        sex = factor(sex, 
+                     levels = c(1,2), 
+                     labels =  c("Male",
+                                    "Female")
+                        ),
+        
+        education = factor(education,
+                           levels = c(1:4),
+                           labels = c("Graduate School",
+                                      "University",
+                                      "Highschool",
+                                      "Others")
+                           ),
+        
+        marriage = factor(marriage,
+                          levels = c(1:3),
+                          labels = c("Married",
+                                     "Single",
+                                     "Others"),
+                          ),
+        
+        default_payment_next_month = factor(default_payment_next_month, 
+                                            levels = c(0,1),
+                                            labels = c("No", "Si"))
+        ) %>% 
+    
+    # Transformando las variables pay0 a pay6
+    mutate_at(c(7:12),
+              ~ factor(., 
+                       levels = c(-2:9),
+                       labels = c("No consumption", "Pay duly", "Customer paid the debt partially",
+                          "Payment delay for one month", "Payment delay for two months",
+                          "Payment delay for three months", "Payment delay for four months",
+                          "Payment delay for five months", "Payment delay for six months",
+                          "Payment delay for seven months", "Payment delay for eight months",
+                          "Payment delay for nine months or more"))
+              ) %>% 
+    
+    mutate(
+        
+        # Discretizando la variable Edad mediante kmeans
+        age_disc = discretize(age, method = "cluster", breaks = 4),
+        
+        # Discretizando la variable Limit Balance
+        limit_bal_disc = discretize(limit_bal, method = "cluster", breaks = 4, dig.lab = 7)
+        
+        )
+
+
+```
+
+Al analizar el default con la variable sexo, se puede ver que en:
+
+- Que los clientes que hicieron default tienen un limite mediana menor que las que no hicieron default, lo cual me hace pensar que quizás al mommento de
+  de la otorgación de la tarjeta, el banco consideraba a esos clientes más riesgosos
+
+- No existen diferencias por sexo en cuanto a las variables bill amount
+
+- Los clientes que no hicieron default realizan un pago mediano mayor de su tarjeta de crédito que los que si hicieron default
+
+
+```{r}
+
+for (col in names(tidy_data[c(2, 13:24)])) {
+    
+    y_lab <- col
+    
+    plot_data <- tidy_data %>% 
+        select(!!sym(col), sex, default_payment_next_month)
+        
+    
+    # Filtrando Outliers Mediante el método del IQR
+    q1 <- quantile(plot_data[[y_lab]], 0.25)
+    q3 <- quantile(plot_data[[y_lab]], 0.75)
+    
+    #IQR
+    iqr <- q3 - q1
+    lower_limit <- q1 - 1.5 * iqr
+    upper_limit <- q3 + 1.5 * iqr
+    
+    # Filtrando los datos a graficar
+    plot_data <- plot_data %>%
+      filter(!!sym(col) >= lower_limit & !!sym(col) <= upper_limit)
+    
+    box_plot <- ggplot(plot_data, aes(x = sex, y = !!sym(col), fill = default_payment_next_month)) +
+        geom_boxplot(alpha = 0.65) +
+        theme_tq() +
+        labs(y = y_lab)
+    
+    print(box_plot)
+    
+}
+
+```
+
+Al estudiar las variables cuantitativas por grupos de edades, se aprecia como para las edades comprendidas entre 21 y 27.7 años y los mayores o igueales a 44.9 años tienen un limite en las tdc mediano menor que los clientes con edades comprendidas entre 27.8 y 44.8 años esto principalmente motivado por el ciclo de vida en el que se encuentran los clientes.
+
+Se espera que los clientes con edades entre 27.8 a 44.8 años se encuentren en un ciclo de vida más estable y generando ingresos para afrontar sus obligaciones financieras.
+
+En cuanto a la variable bill ammount no se evidencian diferencias y para la variable pay_ammount se aprecia que quienes no hacen default realizan un pago mediano mayor en comparación con los que si hacen default
+
+```{r}
+
+for (col in names(tidy_data[c(2, 13:24)])) {
+    
+    y_lab <- col
+    
+    plot_data <- tidy_data %>% 
+        select(!!sym(col), age, default_payment_next_month) %>% 
+        mutate(
+            
+        age = discretize(age, method = "cluster", breaks = 4)
+        
+        )
+    
+    # Filtrando Outliers Mediante el método del IQR
+    q1 <- quantile(plot_data[[y_lab]], 0.25)
+    q3 <- quantile(plot_data[[y_lab]], 0.75)
+    
+    #IQR
+    iqr <- q3 - q1
+    lower_limit <- q1 - 1.5 * iqr
+    upper_limit <- q3 + 1.5 * iqr
+    
+    # Filtrando los datos a graficar
+    plot_data <- plot_data %>%
+      filter(!!sym(col) >= lower_limit & !!sym(col) <= upper_limit)
+    
+    box_plot <- ggplot(plot_data, aes(x = age, y = !!sym(col), fill = default_payment_next_month)) +
+        geom_boxplot(alpha = 0.65) +
+        theme_tq() +
+        labs(y = y_lab)
+    
+    print(box_plot)
+    
+}
+
+```
+
+Para la variable eduaction se aprecia que mientras más alto sea el nivel educativo de la persona el limite de crédito se incrementa.
+
+Al igual que en las variables anteriores, se observa que no hay diferencias en las variables bill_ammount y en pay_ammount, los clientes que hacen default pagan menos que los que no hacen default. Para el limite de crédito se observa que los que hacen default tienen menos crédito que los que no hacen default.
+
+
+```{r}
+
+for (col in names(tidy_data[c(2, 13:24)])) {
+    
+    y_lab <- col
+    
+    plot_data <- tidy_data %>% 
+        select(!!sym(col), education, default_payment_next_month) 
+    
+   # Filtrando Outliers Mediante el método del IQR
+    q1 <- quantile(plot_data[[y_lab]], 0.25)
+    q3 <- quantile(plot_data[[y_lab]], 0.75)
+    
+    #IQR
+    iqr <- q3 - q1
+    lower_limit <- q1 - 1.5 * iqr
+    upper_limit <- q3 + 1.5 * iqr
+    
+    # Filtrando los datos a graficar
+    plot_data <- plot_data %>%
+      filter(!!sym(col) >= lower_limit & !!sym(col) <= upper_limit)
+    
+    box_plot <- ggplot(plot_data, aes(x = education, y = !!sym(col), fill = default_payment_next_month)) +
+        geom_boxplot(alpha = 0.65) +
+        theme_tq() +
+        labs(y = y_lab)
+    
+    print(box_plot)
+    
+}
+
+```
+
+Para la variable marriage, se observa que las personas casadas tienden a tener un límite de crédito más alto en comparación con las personas solteras y otras categorías.
+
+Al igual que en las variables anteriores, se nota que no hay diferencias significativas en las variables bill_amount. Los clientes que incurren en default pagan menos en comparación con aquellos que no incurren en default. Además, se observa que los clientes que hacen default suelen tener un límite de crédito más bajo que los que no hacen default.
+
+
+
+```{r}
+
+for (col in names(tidy_data[c(2, 13:24)])) {
+    
+    y_lab <- col
+    
+    plot_data <- tidy_data %>% 
+        select(!!sym(col), marriage, default_payment_next_month)
+    
+        # Filtrando Outliers Mediante el método del IQR
+    q1 <- quantile(plot_data[[y_lab]], 0.25)
+    q3 <- quantile(plot_data[[y_lab]], 0.75)
+    
+    #IQR
+    iqr <- q3 - q1
+    lower_limit <- q1 - 1.5 * iqr
+    upper_limit <- q3 + 1.5 * iqr
+    
+    # Filtrando los datos a graficar
+    plot_data <- plot_data %>%
+      filter(!!sym(col) >= lower_limit & !!sym(col) <= upper_limit)
+    
+    box_plot <- ggplot(plot_data, aes(x = marriage, y = !!sym(col), fill = default_payment_next_month)) +
+        geom_boxplot(alpha = 0.65) +
+        theme_tq() +
+        labs(y = y_lab)
+    
+    print(box_plot)
+    
+}
+
+```
+
+Al discretizar la variable limit_bal, observamos que existen diferencias en cuanto al bill_ammount y pay_ammount, pero se mantienen las tendencias en donde los clientes que no hacen default pagan mas que los que si hacen default.
+
+```{r}
+
+for (col in names(tidy_data[c(2, 13:24)])) {
+    
+    y_lab <- col
+    
+    plot_data <- tidy_data %>% 
+        select(!!sym(col), limit_bal_disc, default_payment_next_month)
+    
+        # Filtrando Outliers Mediante el método del IQR
+    q1 <- quantile(plot_data[[y_lab]], 0.25)
+    q3 <- quantile(plot_data[[y_lab]], 0.75)
+    
+    #IQR
+    iqr <- q3 - q1
+    lower_limit <- q1 - 1.5 * iqr
+    upper_limit <- q3 + 1.5 * iqr
+    
+    # Filtrando los datos a graficar
+    plot_data <- plot_data %>%
+      filter(!!sym(col) >= lower_limit & !!sym(col) <= upper_limit)
+    
+    box_plot <- ggplot(plot_data, aes(x = limit_bal_disc, y = !!sym(col), fill = default_payment_next_month)) +
+        geom_boxplot(alpha = 0.65) +
+        theme_tq() +
+        labs(y = y_lab)
+    
+    print(box_plot)
+    
+}
+
+```
+
+Podemos observar en las tablas de proporciones que:
+
+Hay más mujeres en Default que hombres
+Los graduados universitarios concentran la mayor proporción de clientes en default
+Los solteros son más probables que hagan default seguido muy cerca por los casados
+La mayor cantidad de clientes que caen en default, tienen un limite de tarjeta de crédito menor a 2755 euros
+
+
+```{r}
+
+# Realizamos un análisis de proporciones con la variable default
+
+table(tidy_data$default_payment_next_month, tidy_data$sex) %>% prop.table(margin = 1) %>% round(digits = 4)
+
+table(tidy_data$default_payment_next_month, tidy_data$education) %>% prop.table() %>% round(digits = 4)
+
+table(tidy_data$default_payment_next_month, tidy_data$marriage) %>% prop.table() %>% round(digits = 4)
+
+table(tidy_data$default_payment_next_month, tidy_data$age_disc) %>% prop.table() %>% round(digits = 4)
+
+table(tidy_data$default_payment_next_month, tidy_data$limit_bal_disc) %>% prop.table() %>% round(digits = 4)
+
+```
+Con estas tablas, podemos complementar el analisis grafico hecho y entender mejor las proporciones para cada una de las categorias de las variables de interes.
+
+Pruebas de significancia estadistica entre las variables con el paquete DescTools para validar la asociación de las variables
+
+
+```{r}
+
+cat("CramerV default ~ sex\n")
+CramerV(table(tidy_data$default_payment_next_month, tidy_data$sex))
+
+cat("\nCramerV default ~ education\n")
+CramerV(table(tidy_data$default_payment_next_month, tidy_data$education)) 
+
+cat("\nCramerV default ~ marriage\n")
+CramerV(table(tidy_data$default_payment_next_month, tidy_data$marriage))
+
+cat("\nCramerV default ~ age_disc\n")
+CramerV(table(tidy_data$default_payment_next_month, tidy_data$age_disc))
+
+cat("\nCramerV default ~ limit_bal_disc\n")
+CramerV(table(tidy_data$default_payment_next_month, tidy_data$limit_bal_disc))
+
+cat("\nCramerV default ~ pay_0\n")
+CramerV(table(tidy_data$default_payment_next_month, tidy_data$pay_0)[,1:11])
+
+cat("\nCramerV default ~ pay_2\n")
+CramerV(table(tidy_data$default_payment_next_month, tidy_data$pay_2)[,1:10])
+
+cat("\nCramerV default ~ pay_3\n")
+CramerV(table(tidy_data$default_payment_next_month, tidy_data$pay_3)[,1:11])
+
+cat("\nCramerV default ~ pay_4\n")
+CramerV(table(tidy_data$default_payment_next_month, tidy_data$pay_4)[,1:11])
+
+cat("\nCramerV default ~ pay_6\n")
+CramerV(table(tidy_data$default_payment_next_month, tidy_data$pay_5)[,c(1:3,5:10)])
+
+cat("\nCramerV default ~ pay_6\n")
+CramerV(table(tidy_data$default_payment_next_month, tidy_data$pay_6)[,c(1:3,5:10)])
+
+```
+
+Con el estadístico de cramerV podemos observar como existe una asociación media entre las variables pay_0 y default. Con el resto de variables se puede observar 
+una asociación baja.
+
+```{r}
+
+# Calculando el balance del cliente para incorporar a los datos
+tidy_data <- tidy_data %>% 
+    
+    mutate(
+        
+        balance1 = bill_amt1 - pay_amt1,
+        balance2 = bill_amt2 - pay_amt2,
+        balance3 = bill_amt3 - pay_amt3,
+        balance4 = bill_amt4 - pay_amt4,
+        balance5 = bill_amt5 - pay_amt5,
+        balance6 = bill_amt6 - pay_amt6
+    )
+
+```
+
+
+
+```{r}
+# Creando la proporción del pago hecho
+tidy_data <- tidy_data %>% 
+    
+    mutate(
+        
+        ptn_payed1 = round(case_when(
+            
+            # Si el cliente tiene saldo a favor y realiza pago a su tdc = 100%
+            bill_amt1 <= 0 & pay_amt1 > 0 ~ 1,
+            
+            # Si el saldo de la tdc es cero el pago debe ser igual a cero
+            bill_amt1 <= 0 & pay_amt1 == 0 ~ 0,
+            
+            # En cualquier otro caso se divide el pago entre el saldo de la factura
+            TRUE ~ pmin(pay_amt1/ bill_amt1, 1)
+            ), 2),
+        
+        ptn_payed2 = round(case_when(
+            bill_amt2 <= 0 & pay_amt2 > 0 ~ 1,
+            bill_amt2 <= 0 & pay_amt2 == 0 ~ 0,
+            TRUE ~ pmin(pay_amt2/ bill_amt2, 1)
+            ), 2),
+        
+        ptn_payed3 = round(case_when(
+            bill_amt3 <= 0 & pay_amt3 > 0 ~ 1,
+            bill_amt3 <= 0 & pay_amt3 == 0 ~ 0,
+            TRUE ~ pmin(pay_amt3/ bill_amt3, 1)
+            ), 2),
+        
+        ptn_payed4 = round(case_when(
+            bill_amt4 <= 0 & pay_amt4 > 0 ~ 1,
+            bill_amt4 <= 0 & pay_amt4 == 0 ~ 0,
+            TRUE ~ pmin(pay_amt4/ bill_amt4, 1)
+            ), 2),
+        
+        ptn_payed5 = round(case_when(
+            bill_amt5 <= 0 & pay_amt5 > 0 ~ 1,
+            bill_amt5 <= 0 & pay_amt5 == 0 ~ 0,
+            TRUE ~ pmin(pay_amt5/ bill_amt5, 1)
+            ), 2),
+        
+        ptn_payed6 = round(case_when(
+            bill_amt6 <= 0 & pay_amt6 > 0 ~ 1,
+            bill_amt6 <= 0 & pay_amt6 == 0 ~ 0,
+            TRUE ~ pmin(pay_amt6/ bill_amt6, 1)
+            ), 2)
+        )
+
+
+```
+
+
+En el resumen de datos se puede observar que la información no contiene valores nulos
+
+```{r resumen descriptivo}
+
+skim(tidy_data)
+
+```
+
+
+Visualización de datos para entender mejor la distribución de las variables, en las cuales se observa de manera gráfica los resultados obtenidos con el análisis de las tablas de contingencia
+
+```{r}
+
+# Graficos para variables cualitativas
+
+cuali_data <- tidy_data %>%
+    
+    # Seleccionando solo variables cualitativas de tipo factor
+    select_if(is.factor)
+
+# Columnas sobre las cuales iterará el for
+columnas <- c("limit_bal_disc", "age_disc", "sex", "education", "marriage", "pay_0", "pay_2", "pay_3", "pay_4", "pay_5", "pay_6")
+
+# Aplicar el código directamente dentro del bucle
+for (col in columnas) {
+  count_table <- as.data.frame(cuali_data) %>% 
+    group_by(!!sym(col), default_payment_next_month) %>%
+    summarise(registros = n(), .groups = 'drop')
+  
+  plot_row <- ggplot(count_table, aes(x = !!sym(col), y = registros, fill = default_payment_next_month)) +
+    geom_col(alpha = 0.6) +
+    labs(x = col, y = "Count") + 
+    theme_tq() + 
+    theme(axis.text.x = element_text(angle = 60, hjust = 1)) +
+      labs(
+        title = paste("Distribución de la variable", col),
+        subtitle = "Comparación entre Clientes que Incumplen y Cumplen el Pago",
+        x = col,
+        y = "Conteo",
+        fill = "Default el mes próximo"
+    )
+  
+  print(plot_row)
+}
+
+```
+
+Hacemos un zoom en los clientes con limite de crédito menor a 2755 euros y observamos que la mayoría son jóvenes menores de 30 años universitarios y solteros del sexo femenino
+
+```{r}
+
+# Graficos para variables cualitativas
+
+tidy_data %>%
+    filter(limit_bal_disc == "[290,2753.852)") %>%
+    group_by(age_disc, default_payment_next_month) %>% 
+    summarise(registros = n()) %>% 
+    ungroup() %>% 
+    ggplot(aes(x = age_disc, y = registros, fill = default_payment_next_month)) + 
+    geom_col(alpha = 0.6)
+
+
+tidy_data %>%
+    filter(limit_bal_disc == "[290,2753.852)") %>%
+    group_by(education, default_payment_next_month) %>% 
+    summarise(registros = n()) %>% 
+    ungroup() %>% 
+    ggplot(aes(x = education, y = registros, fill = default_payment_next_month)) + 
+    geom_col(alpha = 0.6)
+    
+
+tidy_data %>%
+    filter(limit_bal_disc == "[290,2753.852)") %>%
+    group_by(sex, default_payment_next_month) %>% 
+    summarise(registros = n()) %>% 
+    ungroup() %>% 
+    ggplot(aes(x = sex, y = registros, fill = default_payment_next_month)) + 
+    geom_col(alpha = 0.6)
+
+tidy_data %>%
+    filter(limit_bal_disc == "[290,2753.852)") %>%
+    group_by(marriage, default_payment_next_month) %>% 
+    summarise(registros = n()) %>% 
+    ungroup() %>% 
+    ggplot(aes(x = marriage, y = registros, fill = default_payment_next_month)) + 
+    geom_col(alpha = 0.6)
+
+
+```
+
+Con los gráficos de caja podemos estudiar la distribución de las variables cuantitativas de interés, en las cuales observamos que no existe mayor diferencia entre las poblaciones a excepción de las variables ptn_payed, las cuales miden la proporción pagada por el cliente con respecto al monto que debía pagar. En estas variables se observa que los clientes que no hicieron default realizan un pago mayor a los clientes que hacen default.
+
+```{r warning=FALSE}
+
+
+# Graficos para variables cuantitativas
+cuanti_data <- tidy_data %>%
+  # Seleccionando solo variables cuantitativas
+  select(starts_with("pay_amt")) #, "pay_amt", "ptn")))
+
+for (col in names(cuanti_data)) {
+  data_cuanti <- tidy_data %>% 
+    select(!!sym(col), default_payment_next_month)
+  
+  plot_cuanti <- ggplot(data_cuanti, aes(x = default_payment_next_month, y = log(!!sym(col)))) +
+    geom_boxplot(alpha = 0.6, fill = "blue") +
+    labs(x = "Default", y = col) +  # Etiquetas de los ejes
+    scale_y_continuous(breaks = seq(0, 30000, 5000)) +
+    theme_tq()
+  
+  print(plot_cuanti) 
+}
+
+```
+
+
+
+```{r}
+
+# Graficos para variables cuantitativas
+cuanti_data <- tidy_data %>%
+  # Seleccionando solo variables cuantitativas
+  select(starts_with("pay_amt")) #, "pay_amt", "ptn")))
+
+for (col in names(cuanti_data)) {
+    
+    y_lab <- col
+    
+    plot_data <- tidy_data %>% 
+        select(!!sym(col), default_payment_next_month)
+    
+        # Filtrando Outliers Mediante el método del IQR
+    q1 <- quantile(plot_data[[y_lab]], 0.25)
+    q3 <- quantile(plot_data[[y_lab]], 0.75)
+    
+    #IQR
+    iqr <- q3 - q1
+    lower_limit <- q1 - 1.5 * iqr
+    upper_limit <- q3 + 1.5 * iqr
+    
+    # Filtrando los datos a graficar
+    plot_data <- plot_data %>%
+      filter(!!sym(col) >= lower_limit & !!sym(col) <= upper_limit)
+    
+    box_plot <- ggplot(plot_data, aes(x = default_payment_next_month, y = !!sym(col))) +
+        geom_boxplot(alpha = 0.60, fill = "blue") +
+        theme_tq() +
+        labs(y = y_lab)
+    
+    print(box_plot)
+    
+}
+
+```
+
+
+Con los gráficos de violín, podemos visualizar cómo difiere la distribución de la variable "ptn_payed" entre los clientes que no incumplieron con el pago (sin default) y aquellos que sí lo hicieron.
+
+```{r warning=FALSE}
+
+
+# Graficos para variables cuantitativas
+cuanti_data <- tidy_data %>%
+  # Seleccionando solo variables cuantitativas
+  select(limit_bal, age, starts_with(c("bill_", "pay_amt", "ptn")))
+
+for (col in names(cuanti_data)) {
+  data_cuanti <- tidy_data %>% 
+    select(!!sym(col), default_payment_next_month)
+  
+  plot_cuanti <- ggplot(data_cuanti, aes(x = default_payment_next_month, y = !!sym(col))) +
+      geom_violin(alpha = 0.6, fill = "blue") +
+      labs(x = "Default", y = col) +  # Etiquetas de los ejes
+      theme_tq()
+  
+  print(plot_cuanti) 
+}
+
+```
+
+Las funciones de densidad nos muestran la distribución de las variables cuantitativas que en su gran mayoría tienen sesgo positivo. En el caso de las variables ptn_payed se observa una bimodalidad en sus distribuciones.
+
+```{r}
+
+# Graficos para variables cuantitativas
+cuanti_data <- tidy_data %>%
+  # Seleccionando solo variables cuantitativas
+  select(limit_bal, age, starts_with(c("bill_", "pay_amt", "ptn")))
+
+for (col in names(cuanti_data)) {
+  data_cuanti <- tidy_data %>% 
+    select(!!sym(col))
+  
+  plot_cuanti <- ggplot(data_cuanti, aes(x = !!sym(col))) +
+    geom_density(alpha = 0.6, fill = "blue") +
+    labs(x = col, y = "Count") +  # Etiquetas de los ejes
+    theme_tq()
+  
+  print(plot_cuanti) 
+}
+
+```
+
+Con las distribuciones podemos observar que solo en las variables limit_bal, age y las ptn_payed tienen areas en donde la cantidad de clientes en default son mayor a la de los clientes que no están en default. En el caso de la variable limit_bal se aprecia incluso como a partir de la mediana la proporción de clientes en default disminuye a medida que se incrementa el limite de la tarjeta
+
+
+```{r}
+
+
+# Graficos para variables cuantitativas
+cuanti_data <- tidy_data %>%
+  # Seleccionando solo variables cuantitativas
+  select(limit_bal, age, starts_with(c("bill_", "pay_amt", "ptn")))
+
+for (col in names(cuanti_data)) {
+  data_cuanti <- tidy_data %>% 
+    select(!!sym(col), default_payment_next_month)
+  
+  # Calcular los estadísticos (Q1, Mediana, Q3) de la columna
+  q1 <- quantile(data_cuanti[[col]], 0.25)
+  median_val <- median(data_cuanti[[col]])
+  q3 <- quantile(data_cuanti[[col]], 0.75)
+  
+  # Crear el gráfico de densidad
+  plot_cuanti <- ggplot(data_cuanti, aes(x = !!sym(col), fill = default_payment_next_month)) +
+    geom_density(alpha = 0.6) +
+    labs(x = col, y = "Density") +  # Etiquetas de los ejes
+    theme_minimal() +
+    # Agregar líneas verticales para Q1, Mediana y Q3
+    geom_vline(xintercept = c(q1, median_val, q3), linetype = "dashed", color = "red") +
+    scale_fill_discrete(name = "Default", labels = c("No", "Yes"))
+  
+  print(plot_cuanti)  
+}
+
+```
+Preprocesado de datos para el entrenamiento de modelos
+
+```{r}
+
+# Creamos un nuevo dataset para aplicar one hot encoding
+tidy_data_encoded <- tidy_data %>% 
+    select(limit_bal, age, sex, education, marriage, pay_0:pay_6, bill_amt1:pay_amt6, balance1:ptn_payed6, default_payment_next_month)
+
+# Definiendo un vector con las variables a codificar
+oh_encoded <- c("marriage", "education", "sex", "pay_0", "pay_2", "pay_3", "pay_4", "pay_5", "pay_6")
+
+# Aplicando one hot encoding
+tidy_data_encoded <- dummy_cols(tidy_data[, oh_encoded])
+
+# Combinar las nuevas dummy variables con las variables originales del dataframe
+tidy_data_encoded <- cbind(tidy_data[, -which(colnames(tidy_data) %in% oh_encoded)], tidy_data_encoded) %>% 
+    select(- marriage, - education, - sex, - pay_0, - pay_2, - pay_3, - pay_4, - pay_5, - pay_6, -age_disc, limit_bal_disc)
+
+```
+
+
+
+```{r}
+
+# Rescalando las variables cuantitativas con la normal estandar
+tidy_data_encoded <- tidy_data_encoded %>% 
+    mutate_at(
+        c(2:15, 19:30),
+        ~ scale(.)
+    ) %>% 
+    select(-`pay_0_Payment delay for nine months or more`,
+           -`pay_2_Payment delay for nine months or more`,
+           -`pay_3_Payment delay for three months`,
+           -`pay_3_Payment delay for nine months or more`,
+           -`pay_5_Payment delay for one month`,
+           -`pay_5_Payment delay for nine months or more`,
+           -`pay_6_Payment delay for one month`,
+           -`pay_6_Payment delay for nine months or more`
+           ) %>% 
+    clean_names()
+
+```
+
+
+
+
+Analizando la correlación
+
+```{r}
+
+cor_data <- tidy_data_encoded %>% 
+    mutate_all(as.numeric)
+
+# Convertir la matriz de correlaciones a un marco de datos adecuado para ggplot2
+cor_mat <- cor(cor_data)
+
+# Se validó la correlación en un excel quedando como variables más correlacionadas las siguientes
+vars_cor <-  c("default_payment_next_month", "pay_0_payment_delay_for_two_months", "pay_2_payment_delay_for_two_months", "pay_3_payment_delay_for_two_months", "pay_4_payment_delay_for_two_months", "pay_5_payment_delay_for_two_months", "pay_0_customer_paid_the_debt_partially", "pay_6_payment_delay_for_two_months", "pay_2_customer_paid_the_debt_partially", "limit_bal", "pay_0_payment_delay_for_three_months", "pay_3_customer_paid_the_debt_partially", "pay_0_payment_delay_for_one_month", "ptn_payed3")
+
+```
+Las variables más correlacionadas con la variable objetivo son aquellas que resultan de la transformación one hot encoding
+
+```{r}
+
+# Transformando la matriz de correlaciones en un df
+tidy_data_cor <- cor_data %>% 
+    select(all_of(vars_cor)) %>% 
+    cor() %>% 
+    as.data.frame()
+
+# Pivoteamos el df para graficarlo con ggplot
+tidy_data_cor <- tidy_data_cor %>% 
+    rownames_to_column(var = "var1") %>% 
+    pivot_longer(cols = -var1, names_to = "var2", values_to = "correlacion")
+
+# Crear el gráfico de heatmap con la matriz de correlaciones
+cor_plot_1 <- ggplot(data = tidy_data_cor, aes(x = var1, y = var2, fill = correlacion)) +
+    geom_tile() +  # Usamos geom_tile para crear el mapa de calor
+    scale_fill_viridis(name = "Correlación") +  # Escala de colores con etiqueta personalizada
+    labs(title = "Mapa de Calor de Correlaciones") +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) +  # Girar etiquetas del eje x
+    theme(axis.title.x = element_blank(),  # Eliminar etiquetas del eje y
+    axis.title.y = element_blank(),
+    legend.position = "right",  # Mover la leyenda al lado derecho
+    legend.title.align = 0.5)
+
+print(cor_plot_1)
+
+```
+
+
+```{r}
+
+# Creando un dataset para entrenar los modelos con las variables mas correlacionadas con la variable objetivo
+model_df <- tidy_data_encoded %>% 
+    select(all_of(vars_cor)) %>% 
+    mutate(default_payment_next_month = if_else(default_payment_next_month == "Si", 1, 0),
+           limit_bal = as.numeric(limit_bal),
+           ptn_payed3 = as.numeric(ptn_payed3))
+
+# Renombraremos las variables para visualizarlas mejor 
+
+var_id <- as.character(1:14)
+
+names(model_df) <- var_id
+
+# Realizando la separación de los datos mediante muestreo estratificado ya que contamos con un desbalanceo
+# en la variable objetivo donde hay menos clientes que hacen default
+
+# Sembrando semilla para la reproducibilidad
+set.seed(123)
+
+# Creando una partición estratificada
+train_index <- createDataPartition(model_df$`1`, p = 0.7, 
+                                  list = FALSE, 
+                                  times = 1)
+
+# Crear los conjuntos de entrenamiento y prueba
+train_data_st <- model_df[train_index, ]
+test_data_st <- model_df[-train_index, ]
+
+# Verificar las proporciones en los conjuntos de entrenamiento y prueba
+cat("Proporciones en el conjunto de entrenamiento:\n")
+print(table(train_data_st$default_payment_next_month) %>% prop.table() %>% round(2))
+
+cat("Proporciones en el conjunto de prueba:\n")
+print(table(test_data_st$default_payment_next_month) %>% prop.table() %>% round(2))
+
+```
+
+
+
+```{r}
+# Ejecución del algoritmo de boruta
+
+set.seed(123)  # Para reproducibilidad
+boruta_result <- Boruta(`1` ~ ., data = train_data_st, doTrace = 2)
+
+# Imprimir el resultado
+print(boruta_result)
+
+# Obtener las características importantes
+important_vars <- getSelectedAttributes(boruta_result, withTentative = TRUE)
+print(important_vars)
+
+# Tabla de las decisiones tomadas por Boruta
+boruta_decision <- attStats(boruta_result)
+print(boruta_decision)
+
+# Visualizar los resultados de Boruta
+plot(boruta_result, las = 2, cex.axis = 0.7)
+
+
+```
+
+
+
+```{r}
+# Definir la variable objetivo
+target <- "default_payment_next_month"
+
+# Crear un grid de hiperparámetros para cada modelo
+
+# Definiendo search grid para random forest
+rf_grid <- expand.grid(.mtry =2:4)
+
+# Definiendo search grid para svm
+svm_grid <- expand.grid(
+  sigma = c(0.01, 0.1, 1), 
+  C = c(0.1, 1, 10)
+)
+
+# Definiendo search grid para neural networks
+nn_grid <- expand.grid(size = c(5, 10, 15),
+                       decay = c(0.1, 0.01, 0.001))
+
+rl_grid <- expand.grid(
+    .alpha = c(0, 0.5, 1),
+    .lambda = seq(0.01, by = 0.01)
+    )
+
+# Definiendo search grid para xgboost
+xgb_grid <- expand.grid(max_depth = c(3, 5, 7), 
+                        nrounds = (1:10)*50,   
+                        eta = 0.3,
+                        gamma = 0,
+                        subsample = 1,
+                        min_child_weight = 1,
+                        colsample_bytree = 0.6)
+
+```
+
+
+
+```{r}
+
+set.seed(123)
+
+# Entrenamiento de modelos
+modelos <- list(
+    
+  Random_Forest = train(default_payment_next_month ~ ., 
+                        data = train_data, 
+                        method = "rf", 
+                        trControl = trainControl(method = "cv", number = 5), 
+                        tuneGrid = rf_grid),
+  
+  SVM = train(default_payment_next_month ~ ., 
+              data = train_data, 
+              method = "svmRadial", 
+              trControl = trainControl(method = "cv", number = 5), 
+              tuneGrid = svm_grid),
+  
+  Redes_Neuronales = train(default_payment_next_month ~ ., 
+                           data = train_data, 
+                           method = "nnet", 
+                           trControl = trainControl(method = "cv", number = 5), 
+                           tuneGrid = nn_grid),
+  
+  Regresion_Logistica = train(default_payment_next_month ~ ., 
+                              data = train_data, 
+                              method = "glm", 
+                              family = "binomial", 
+                              trControl = trainControl(method = "cv", number = 5)),
+  
+  XGBoost = train(default_payment_next_month ~ ., 
+                  data = train_data, 
+                  method = "xgbTree", 
+                  trControl = trainControl(method = "cv", number = 5, search = "grid"), 
+                  tuneGrid = xgb_grid)
+)
+
+
+
+```
+
+De los resultados preliminares de accuracy podemos concluir que el modelo de svm fue quien mejor precición y coeficiente de kappa tuvo con una precición de 0.8301730 y kappa de 0.4007326
+
+```{r}
+
+# Evaluar desempeño de modelos
+metricas <- resamples(modelos)
+
+# Imprimir métricas de desempeño
+summary(metricas)
+
+```
+
+
+```{r}
+
+# Semilla para la reproducibilidad
+set.seed(123)
+
+# Evaluando el modelo de Random Forest
+modelo_rf <- train(default_payment_next_month ~ ., 
+                        data = train_data, 
+                        method = "rf", 
+                        trControl = trainControl(method = "cv", number = 5), 
+                        .mtry = 4) # Parametro con mayor kappa
+
+# Realizar predicciones con el modelo entrenado en el conjunto de prueba
+pred_rf <- predict(modelos$Random_Forest, test_data)
+prob_rf <- predict(modelos$Random_Forest, test_data, type = "prob")[,2]
+
+# Calcular la matriz de confusión
+confusion_rf <- confusionMatrix(pred_rf, test_data$default_payment_next_month)
+
+# Generar la curva ROC y calcular el AUC
+roc_rf <- roc(test_data$default_payment_next_month, prob_rf)
+auc_rf <- auc(roc_rf)
+
+cat("Random Forest:\n")
+print(confusion_rf)
+cat("AUC-ROC:", auc_rf, "\n\n")
+
+
+# Graficar la curva ROC
+plot(roc_rf, main = paste("ROC Curve (AUC =", round(auc_rf, 2), ")"))
+
+```
+
+```{r}
+
+# Semilla para la reproducibilidad
+set.seed(123)
+
+# Definiendo hiperparametros
+svm_grid_2 <- expand.grid(C = 10, sigma = 0.01)
+
+# Evaluando el modelo de SVM
+modelo_svm <- train(default_payment_next_month ~ ., 
+              data = train_data, 
+              method = "svmRadial", 
+              trControl = trainControl(method = "cv", number = 5, classProbs =  TRUE), 
+              tuneGrid = svm_grid_2)
+
+# Realizar predicciones con el modelo entrenado en el conjunto de prueba
+pred_svm <- predict(modelo_svm, test_data)
+prob_svm <- predict(modelo_svm, test_data, type = "prob")[,2]
+
+# Calcular la matriz de confusión
+confusion_svm <- confusionMatrix(pred_svm, test_data$default_payment_next_month)
+
+# Generar la curva ROC y calcular el AUC
+roc_svm <- roc(test_data$default_payment_next_month, prob_svm)
+auc_svm <- auc(roc_svm)
+
+cat("SVM:\n")
+print(confusion_svm)
+cat("AUC-ROC:", auc_svm, "\n\n")
+
+# Graficar la curva ROC
+plot(roc_svm, main = paste("ROC Curve (AUC =", round(auc_svm, 2), ")"))
+```
+
+
+```{r}
+
+# Semilla para la reproducibilidad
+set.seed(123)
+
+# Definiendo hiperparametros
+nn_grid_2 <- expand.grid(size = 5,
+                       decay = 0.1)
+
+# Entrenamiento Neural Networks
+modelo_nn <- train(default_payment_next_month ~ ., 
+                   data = train_data, 
+                   method = "nnet", 
+                   trControl = trainControl(method = "cv", number = 5, classProbs = TRUE, summaryFunction = twoClassSummary),
+                   tuneGrid = nn_grid,
+                   metric = "ROC",
+                   trace = FALSE)
+
+# Realizar predicciones con el modelo entrenado en el conjunto de prueba
+pred_nn <- predict(modelo_nn, test_data)
+prob_nn <- predict(modelo_nn, test_data, type = "prob")[,2] # Probabilidad de la clase "Si"
+
+# Calcular la matriz de confusión
+confusion_nn <- confusionMatrix(pred_nn, test_data$default_payment_next_month)
+
+# Generar la curva ROC y calcular el AUC
+roc_nn <- roc(test_data$default_payment_next_month, prob_nn)
+auc_nn <- auc(roc_nn)
+
+# Imprimir los resultados
+cat("Neural Network:\n")
+print(confusion_nn)
+cat("AUC-ROC:", auc_nn, "\n\n")
+
+# Graficar la curva ROC
+plot(roc_nn, main = paste("ROC Curve (AUC =", round(auc_nn, 2), ")"))
+
+```
+
+```{r}
+
+# Semilla para la reproducibilidad
+set.seed(123)
+
+# Entrenamiento Regresión Logística
+modelo_rl <- train(default_payment_next_month ~ ., 
+                   data = train_data, 
+                   method = "glm", 
+                   family = "binomial", 
+                   trControl = trainControl(method = "cv", number = 5, classProbs = TRUE, summaryFunction = twoClassSummary),
+                   metric = "ROC")
+
+
+# Realizar predicciones con el modelo entrenado en el conjunto de prueba
+pred_rl <- predict(modelo_rl, test_data)
+prob_rl <- predict(modelo_rl, test_data, type = "prob")[,2]
+
+# Calcular la matriz de confusión
+confusion_rl <- confusionMatrix(pred_rl, test_data$default_payment_next_month)
+
+# Generar la curva ROC y calcular el AUC
+roc_rl <- roc(test_data$default_payment_next_month, prob_rl)
+auc_rl <- auc(roc_rl)
+
+# Imprimir los resultados
+cat("Logistic Regression (Regularized):\n")
+print(confusion_rl)
+cat("AUC-ROC:", auc_rl, "\n\n")
+
+# Graficar la curva ROC
+plot(roc_rl, main = paste("ROC Curve (AUC =", round(auc_rl, 2), ")"))
+
+```
+
+```{r}
+
+# Semilla para la reproducibilidad
+set.seed(123)
+
+# Definición de hiperparametros
+xgb_grid_2 <- expand.grid(max_depth = 3, 
+                          nrounds = 100,   
+                          eta = 0.3,
+                          gamma = 0,
+                          subsample = 1,
+                          min_child_weight = 1,
+                          colsample_bytree = 0.6)
+
+# Entrenamiento de xgboost
+modelo_xgb <- train(default_payment_next_month ~ ., 
+                  data = train_data, 
+                  method = "xgbTree", 
+                  trControl = trainControl(method = "cv", number = 5, search = "grid"), 
+                  tuneGrid = xgb_grid)
+
+
+# Realizar predicciones con el modelo entrenado en el conjunto de prueba
+pred_xgb <- predict(modelo_xgb, test_data)
+prob_xgb <- predict(modelo_xgb, test_data, type = "prob")[,2]
+
+# Calcular la matriz de confusión
+confusion_xgb <- confusionMatrix(pred_xgb, test_data$default_payment_next_month)
+
+# Generar la curva ROC y calcular el AUC
+roc_xgb <- roc(test_data$default_payment_next_month, prob_xgb)
+auc_xgb <- auc(roc_xgb)
+
+# Imprimir los resultados
+cat("XGBoost:\n")
+print(confusion_xgb)
+cat("AUC-ROC:", auc_xgb, "\n\n")
+
+# Graficar la curva ROC
+plot(roc_xgb, main = paste("ROC Curve (AUC =", round(auc_xgb, 2), ")"))
+
+```
+
+
+Luego de realizar el entrenamiento y validación de los distintos modelos, seleccionaremos el modelo de xgboost ya que este modelo presenta mejores metricas de accuracy (0.8214) y kappa( 0.3716) sobre los modelos de Neural Networks, Regresión Logística y Random Forest de acuerdo con los resultados de la tabla métricas.
+
+Adicionalmente al evaluar los modelos con el indicador AUC ROC, es el modelo xgboost el que tiene el indicador mas alto con 0.7688 seguido por neural networks con 0.7676 
+
+
+```{r}
+
+train_data_2 <- train_data %>% 
+    mutate(default_payment_next_month = if_else(default_payment_next_month == "No", 0, 1))
+
+
+# Convertir los datos de entrenamiento a la matriz DMatrix utilizada por XGBoost
+dtrain <- xgb.DMatrix(data = as.matrix(train_data_2[, 2:14]), 
+                      label = train_data_2$default_payment_next_month)
+
+# Obtener el modelo subyacente de xgboost
+xgb_model <- xgb.train(params = list(objective = "binary:logistic", 
+                                     max_depth = 3, 
+                                     eta = 0.3, 
+                                     gamma = 0, 
+                                     subsample = 1, 
+                                     min_child_weight = 1, 
+                                     colsample_bytree = 0.6),
+                       data = dtrain,
+                       nrounds = 100)
+
+# Obtener la importancia de las características
+importance_matrix <- xgb.importance(model = xgb_model)
+
+# Mostrar la importancia de las características
+print(importance_matrix)
+
+# Visualizar la importancia de las características
+xgb.plot.importance(importance_matrix)
+
+
+
+```
+
+```{r}
+
+
+importance_df <- as.data.frame(importance_matrix)
+
+importance_df <- importance_df %>% 
+    mutate(var = case_when(
+        
+        Feature == "pay_0_payment_delay_for_two_months" ~ "x1",
+        Feature == "pay_2_payment_delay_for_two_months" ~ "x2",
+        Feature == "pay_3_payment_delay_for_two_months" ~ "x3",
+        Feature == "ptn_payed3" ~ "x4",
+        Feature == "limit_bal" ~ "x5", 
+        Feature == "pay_0_customer_paid_the_debt_partially" ~ "x6",
+        Feature == "pay_0_payment_delay_for_three_months" ~ "x7",
+        Feature == "pay_4_payment_delay_for_two_months" ~ "x8",
+        Feature == "pay_0_payment_delay_for_one_month" ~ "x9",
+        Feature == "pay_6_payment_delay_for_two_months" ~ "x10",
+        Feature == "pay_5_payment_delay_for_two_months" ~ "x11",
+        Feature == "pay_2_customer_paid_the_debt_partially" ~ "x12",
+        Feature == "pay_3_customer_paid_the_debt_partially" ~ "x13"
+    ))
+
+# Crear el gráfico de importancia con ggplot2
+ggplot(importance_df, aes(x = reorder(var, -Gain), y = Gain)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  geom_text(aes(label = round(Gain, 3)), hjust = -0.1, size = 3.5) +
+  coord_flip() +
+  labs(title = "Importancia de las Características del Modelo XGBoost",
+       x = "Características",
+       y = "Importancia (Ganancia)") +
+  theme_minimal(base_size = 15) +
+  theme(axis.text.x = element_text(size = 8),
+        axis.text.y = element_text(size = 8),
+        plot.title = element_text(hjust = 0.5, size = 14, face = "bold"))
+
+```
+
+
